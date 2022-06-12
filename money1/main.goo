@@ -1,0 +1,1216 @@
+/*
+
+
+ */
+
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"m/ldarp"
+	"math"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/gomodule/redigo/redis"
+	"github.com/gorilla/websocket"
+
+	_ "github.com/lib/pq"
+)
+
+var addr = flag.String("addr", "0.0.0.0:8080", "http service address") // テスト
+
+/////////////////// bus ////////////////////////
+type BUS struct {
+	number      int             // バス車両番号
+	person_list []*ldarp.PERSON // バスに乗っている人
+
+	destination ldarp.LocInfo // 出発座標
+	arrival     ldarp.LocInfo // 到着座標
+	distance    float64       // 到着座標と出発座標の距離
+	present     ldarp.LocInfo // 現在位置
+
+	destination_number int // 出発座標番号
+	arrival_number     int // 到着座標番号
+}
+
+type PERSON struct {
+	number      int64
+	destination ldarp.LocInfo // 出発座標
+	arrival     ldarp.LocInfo // 到着座標
+	distance    float64       // 到着座標と出発座標の距離
+	present     ldarp.LocInfo // 現在位置
+
+	destination_number int // 出発座標番号
+	arrival_number     int // 到着座標番号
+}
+
+func lrt(lrt_num int) {
+	fmt.Println("LRT is starting.......")
+
+	///////////// 描画処理ここから ////////////////
+	_ = websocket.Upgrader{} // use default options
+
+	flag.Parse()
+	log.SetFlags(0)
+	u := url.URL{Scheme: "ws", Host: *addr, Path: "/echo2"}
+	log.Printf("connecting to %s", u.String())
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer c.Close()
+	///////////// 描画処理ここまで ////////////////
+
+	// 宇都宮
+	gl := ldarp.GetLoc{
+		ID:   -1,               // "-1"としなければならない
+		Lat:  36.5593862940339, // 初期の場所(宇都宮駅ターミナル)
+		Lng:  139.899678743047,
+		TYPE: "LRT", // "PERSON","BUS","LRT","CENTER"のいずれかが選べる
+	}
+
+	gl.POPUP = lrt_num
+
+	err = c.WriteJSON(gl) // here -> echo2
+	if err != nil {
+		log.Println("LRT:1:Write:", err)
+		os.Exit(-1)
+	}
+
+	gl2 := new(ldarp.GetLoc) // echo2 -> here
+	err = c.ReadJSON(gl2)
+	if err != nil {
+		log.Println("LRT:1:Read:", err)
+		os.Exit(-1)
+	}
+
+	gl.ID = gl2.ID
+	fmt.Println("lrt:", lrt_num, "gl.ID:", gl.ID)
+
+	/////// PruneMobileの初期化 ここまで /////////
+
+	for {
+
+		db, err := sql.Open("postgres", "user=postgres password=password host=localhost port=15432 dbname=utsu_rail_db sslmode=disable")
+		if err != nil {
+			log.Fatal("OpenError: ", err)
+		}
+		defer db.Close()
+
+		rows, err := db.Query("SELECT seq,x1,y1 from lrt")
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer rows.Close()
+
+		x1, y1 := -1.0, -1.0
+		_x1, _y1, _x2, _y2 := -1.0, -1.0, -1.0, -1.0
+		px, py := -1.0, -1.0
+		flag := 0
+		f_flag := 0
+		seq := -1
+
+		for rows.Next() {
+
+			if f_flag == 0 { // 初回だけ2二回入力
+				if err := rows.Scan(&seq, &x1, &y1); err != nil {
+					fmt.Println(err)
+				}
+				_x1, _y1 = x1, y1
+				//fmt.Println(x1, y1)
+				f_flag = 1
+				continue
+			}
+
+			if err := rows.Scan(&seq, &x1, &y1); err != nil {
+				fmt.Println(err)
+			}
+			//fmt.Println(seq, ",", x1, ",", y1)
+
+			_x2, _y2 = x1, y1
+
+			_, rad_up := distance_km(_x1, _y1, _x2, _y2)
+
+			px, py = _x1, _y1
+
+			for {
+				// 5.56m/s → 時速20
+
+				px += diff_longitude(0.00556*2*math.Cos(rad_up), py)
+				py += diff_latitude(0.00556 * 2 * math.Sin(rad_up))
+
+				//double rad0 = atan2((end_y - start_y),(end_x - start_x));
+				//double rad1 = atan2((end_y - test_person.p_y),(end_x - test_person.p_x));
+
+				rad0 := math.Atan2((_y2 - _y1), (_x2 - _x1))
+				rad1 := math.Atan2((_y2 - py), (_x2 - px))
+				// ここは、http://kobore.net/over90.jpg で解説してある
+
+				if math.Abs(rad0-rad1) >= math.Pi*0.5 {
+					// 終点越えの場合、終点に座標を矯正する
+					px, py = _x2, _y2
+					flag = 1 // フラグを上げろ
+				}
+
+				////// 移動情報の描画(ここから)
+				//fmt.Println(px, ",", py)
+
+				gl.Lat = py //point.Lat
+				gl.Lng = px //point.Lon
+
+				err = c.WriteJSON(gl) // here -> echo2
+				if err != nil {
+					log.Println("LRT:2:Write:", err)
+					os.Exit(-1)
+				}
+				gl2 := new(ldarp.GetLoc)
+				err = c.ReadJSON(gl2) // echo2 -> here
+
+				if err != nil {
+					log.Println("LRT:2:Read:", err)
+					os.Exit(-1)
+				}
+
+				time.Sleep(time.Millisecond * 100) // 0.1秒待つ
+
+				////// 移動情報の描画(ここまで)
+
+				if flag == 1 {
+					flag = 0
+					_x1, _y1 = _x2, _y2
+					break
+				}
+			}
+			
+			db.Close() //ここで閉じないと、postgreSQLが"pq: sorry, too many clients already"と言ってくる
+
+		} //rows.Next()
+
+	} // LRTが無限に動き続ける
+
+	fmt.Println("LRT is ending.......")
+
+	/////// PruneMobileの終了処理 ここから/////////
+	//gl.ID = gl2.ID
+	//gl.ID = -2  /////// 諸悪の根源
+	gl.Lat = 999.9
+	gl.Lng = 999.9
+
+	err = c.WriteJSON(gl)
+	if err != nil {
+		log.Println("LRT:3:Write:", err)
+		os.Exit(-1)
+	}
+
+	err = c.ReadJSON(gl2)
+	if err != nil {
+		log.Println("LRT:3:Read:", err)
+		os.Exit(-1)
+	}
+
+	fmt.Println("LRT is finished.")
+
+	/////// PruneMobileの終了処理 ここまで/////////
+
+}
+
+func bus(bus_num int) { // Bus
+
+	var bus BUSpq: sorry, too many clients already
+
+	///////////// 描画処理ここから ////////////////
+	_ = websocket.Upgrader{} // use default options
+
+	flag.Parse()
+	log.SetFlags(0)
+	u := url.URL{Scheme: "ws", Host: *addr, Path: "/echo2"}
+	log.Printf("connecting to %s", u.String())
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer c.Close()
+	///////////// 描画処理ここまで ////////////////
+
+	/////// PruneMobileの初期化 ここから/////////
+	/* 豊洲
+	gl := ldarp.GetLoc{
+		ID:   -1,          // "-1"としなければならない
+		Lat:  35.64553503, // 初期の場所
+		Lng:  139.78468208,
+		TYPE: "BUS", // "PERSON","BUS","CENTER"のいずれかが選べる
+	}
+	*/
+
+	// 宇都宮
+	gl := ldarp.GetLoc{
+		ID:   -1,          // "-1"としなければならない
+		Lat:  36.56240644, // 初期の場所
+		Lng:  139.9501693,
+		TYPE: "BUS", // "PERSON","BUS","CENTER","LRT"のいずれかが選べる
+	}
+
+	gl.POPUP = bus_num
+
+	err = c.WriteJSON(gl) // here -> echo2
+	if err != nil {
+		log.Println("BUS:1:Write:", err)
+		os.Exit(-1)
+	}
+
+	gl2 := new(ldarp.GetLoc) // echo2 -> here
+	err = c.ReadJSON(gl2)
+	if err != nil {
+		log.Println("BUS:1:Read:", err)
+		os.Exit(-1)
+	}
+
+	gl.ID = gl2.ID
+	fmt.Println("bus:", bus_num, "gl.ID:", gl.ID)
+
+	/////// PruneMobileの初期化 ここまで /////////
+
+	bus.number = 0
+	bus.destination_number = -1
+	bus.arrival_number = -1
+
+	/////////////////////////////////////////////////////
+	// 準備完了用フラグの送信
+	var c2i ldarp.Ch2_info
+	c2i.Bus_number = bus_num
+	c2i.Person_number = -1
+
+	//ldarp.Ch2 <- -1 // センタにch2送付
+	ldarp.Ch2 <- c2i
+	/////////////////////////////////////////////////////
+
+	/////////////////////////////////////////////////////
+	// バスのステータスのセンタへの送信用
+	var c5i ldarp.Ch5_info
+
+	/////////////////////////////////////////////////////
+
+	a_Point := ldarp.LiPoint //宇都宮中心点
+
+	db, err := sql.Open("postgres",
+		"user=postgres password=password host=localhost port=15432 dbname=utsu_db sslmode=disable")
+	if err != nil {
+		log.Fatal("OpenError: ", err)
+	}
+	defer db.Close()
+
+	flag_for := 0 // 初回検知フラグ
+
+	for {
+		var b_Point ldarp.LocInfo
+
+		if flag_for == 0 {
+			b_Point = ldarp.LiPoint // 初期位置をスタートにする
+			flag_for = 1
+		} else {
+			b_Point = a_Point // 現在のゴールをスタートにする
+		}
+
+		a := <-ldarp.Ch3_bus[bus_num] // センタからch3待ち(ゴールを教えてもらう)
+		//fmt.Println("a := <-ldarp.Ch3_bus[bus_num]", "a=", a, "bus_bum:", bus_num)
+		//fmt.Println("bus No.", bus_num, "is going to station.", a)
+
+		if a != -1 {
+			a_Point = ldarp.Li[a.(int)]
+
+			// ルートの全sourceポイントを出させる
+			rows, err := db.Query("SELECT node as source FROM pgr_dijkstra('SELECT gid as id, source, target,length_m as cost FROM ways', $1::bigint , $2::bigint , false)", b_Point.Source, a_Point.Source)
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer rows.Close()
+
+			f_flag := 0          // 初回検知フラグ
+			x1, y1 := -1.0, -1.0 // Scan用変数
+			_x1, _y1, _x2, _y2 := -1.0, -1.0, -1.0, -1.0
+			px, py := -1.0, -1.0
+			flag := 0
+
+			for rows.Next() { // ルートの全sourceポイントでループさせる
+
+				//// dijkstraが出す1個づつのsourceを取り出す作業(ここから)
+				if err := rows.Scan(&source); err != nil {
+					fmt.Println(err)
+				}
+
+				// source から x1,y1を取り出す為だけに、こんな面倒な処理をしている
+				rows2, err := db.Query("SELECT source, x1, y1 from ways where source = $1::bigint limit 1", source)
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				for rows2.Next() {
+
+					if f_flag == 0 { //初回だけ2居合入力
+						if err := rows2.Scan(&source, &x1, &y1); err != nil {
+							fmt.Println(err)
+						}
+
+						_x1, _y1 = x1, y1
+						fmt.Println(_x1, _y1)
+						f_flag = 1
+						continue
+					}
+
+					if err := rows2.Scan(&source, &x1, &y1); err != nil {
+						fmt.Println(err)
+					}
+					_x2, _y2 = x1, y1
+
+					fmt.Println(_x2, ",", _y2)
+					_, rad_up := distance_km(_x1, _y1, _x2, _y2)
+					//fmt.Println("_x1,_y1,_x2,_y2, rad_up:", _x1, _y1, _x2, _y2, rad_up)
+
+					px, py = _x1, _y1
+
+					for {
+
+						//平均時速20km サンプリング時間は、3.6秒  平均速度は 5.56m 20m/3.6秒
+						// 悩むところだな、サンプリング時間を1秒にするか3.6秒にするか → 1秒にするか。
+						// 距離端数は切り捨てにして、実質は、平均時速を20km以下としよう
+						// (カーブでは減速する、と)
+
+						px += diff_longitude(0.00556*math.Cos(rad_up), py)
+						py += diff_latitude(0.00556 * math.Sin(rad_up))
+
+						//double rad0 = atan2((end_y - start_y),(end_x - start_x));
+						//double rad1 = atan2((end_y - test_person.p_y),(end_x - test_person.p_x));
+
+						rad0 := math.Atan2((_y2 - _y1), (_x2 - _x1))
+						rad1 := math.Atan2((_y2 - py), (_x2 - px))
+						// ここは、http://kobore.net/over90.jpg で解説してある
+
+						if math.Abs(rad0-rad1) >= math.Pi*0.5 {
+							// 終点越えの場合、終点に座標を矯正する
+							px, py = _x2, _y2
+							flag = 1 // フラグを上げろ
+						}
+
+						//////// 計算結果の使い方(ここから)
+						//fmt.Println(px, ",", py)
+						/////// PruneMobileの移動 ここから/////////
+						gl.Lat = py //point.Lat
+						gl.Lng = px //point.Lon
+
+						//fmt.Println("bus_num:", bus_num, point.Lat, point.Lon)
+
+						err = c.WriteJSON(gl) // here -> echo2
+						if err != nil {
+							log.Println("BUS:2:Write:", err)
+							os.Exit(-1)
+						}
+						gl2 := new(ldarp.GetLoc)
+
+						err = c.ReadJSON(gl2) // echo2 -> here
+						if err != nil {
+							log.Println("BUS:2:Read:", err)
+							os.Exit(-1)
+						}
+						/////// PruneMobileの移動 ここまで/////////
+
+						////////////////////////////////////////////////////////
+						// 全乗客へのブロードキャストメッセージの送信
+						// をやめて、センタに情報を集約する
+						// この辺の理由は、https://wp.kobore.net/%e6%b1%9f%e7%ab%af%e3%81%95%e3%82%93%e3%81%ae%e6%8a%80%e8%a1%93%e3%83%a1%e3%83%a2/post-5658/
+						// を参照のこと
+						//broadcaster.Send(bus_num, 1, -1, point.Lat, point.Lon) //最初の"1"座標標情報
+
+						c5i.Bus_num = bus_num
+						c5i.CC = 1
+						c5i.Present = -1
+						c5i.Lat = py //point.Lat
+						c5i.Lon = px //point.Lon
+						ldarp.Ch5 <- c5i
+						////////////////////////////////////////////////////////
+
+						if flag == 1 { // ループ脱出処理
+							flag = 0
+							_x1, _y1 = _x2, _y2
+							break
+						}
+					} // for{}
+				} //for rows2.Next() {
+			} // for rows.Next() {
+
+			////////////////////////////////////////////////////////
+			// 全乗客へのブロードキャストメッセージの送信
+			// をやめて、センタに情報を集約する
+			// この辺の理由は、https://wp.kobore.net/%e6%b1%9f%e7%ab%af%e3%81%95%e3%82%93%e3%81%ae%e6%8a%80%e8%a1%93%e3%83%a1%e3%83%a2/post-5658/
+			// を参照のこと
+
+			//broadcaster.Send(bus_num, 2, a.(int), 0, 0) // 最初の"2" は、停車位置情報
+			/////broadcaster.Send(bus_num, 2, a.(int), ldarp.Li[a.(int)].Lat, ldarp.Li[a.(int)].Lon) // 最初の"2" は、停車位置情報
+			c5i.Bus_num = bus_num
+			c5i.CC = 2
+			c5i.Present = a.(int)
+			c5i.Lat = 0
+			c5i.Lon = 0
+			ldarp.Ch5 <- c5i
+			////////////////////////////////////////////////////////
+
+		} // if a != -1 {
+
+		// 目的地に到着した、あるいは空車連絡の為に、準備完了用フラグを送信
+		//// /// time.Sleep(1 * time.Second) // 1秒待つ ()
+
+		c2i.Bus_number = bus_num
+		c2i.Person_number = -1
+
+		//ldarp.Ch2 <- -1 // センタにch2送付
+		ldarp.Ch2 <- c2i
+
+		//broadcaster.Send(bus_num, 2, a.(int), ldarp.Li[a.(int)].Lat, ldarp.Li[a.(int)].Lon) // 最初の"2" は、停車位置情報
+
+		// 最後に、a_Pointに代入して戻す(いらないか？ sourceがあるから)
+		//a_Point.Lon = px
+		//a_Point.Lat = py
+
+	} // for{} バスに関しては、このforループから出ることはない
+
+	/////// PruneMobileの終了処理 ここから/////////
+	//gl.ID = gl2.ID
+
+	gl.ID = -2
+	gl.Lat = 999.9
+	gl.Lng = 999.9
+
+	err = c.WriteJSON(gl)
+	if err != nil {
+		log.Println("BUS:3:Write:", err)
+		os.Exit(-1)
+	}
+
+	err = c.ReadJSON(gl2)
+	if err != nil {
+		log.Println("BUS:3:Read:", err)
+		os.Exit(-1)
+	}
+	/////// PruneMobileの終了処理 ここまで/////////
+
+}
+
+func random(min, max float64) float64 {
+	return rand.Float64()*(max-min) + min
+}
+
+var Li_mutex sync.Mutex
+
+var source int
+var longitude float64
+var latitude float64
+var dist float64
+
+func position_correction(db *sql.DB, _x1, _y1 float64) (int, float64, float64) {
+
+	str := "SELECT source, x1 as longitude, y1 as latitude, ST_Distance('SRID=4326;POINT(" + fmt.Sprint(_x1) + " " + fmt.Sprint(_y1) + ")'::GEOGRAPHY, the_geom) as dist FROM ways WHERE ST_DWithin(the_geom, ST_GeographyFromText('SRID=4326;POINT(" + fmt.Sprint(_x1) + " " + fmt.Sprint(_y1) + ")'), 300.0) ORDER BY dist LIMIT 1"
+	fmt.Println(str)
+
+	rows, err := db.Query(str)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		if err := rows.Scan(&source, &longitude, &latitude, &dist); err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println(source, longitude, latitude, dist)
+	}
+
+	return source, longitude, latitude
+}
+
+func person() {
+	var person ldarp.PERSON
+	var person_num int
+
+	db, err := sql.Open("postgres",
+		"user=postgres password=password host=localhost port=15432 dbname=utsu_db sslmode=disable")
+	if err != nil {
+		log.Fatal("OpenError: ", err)
+	}
+	defer db.Close()
+
+	// 乗客登録情報の領域を探す
+	// もし、空いていなかったら、リクエストを拒絶する
+	for i := 0; i < 30; i++ {
+		if ldarp.Li[2*i].Lat < 0.0 && ldarp.Li[2*i].Lon < 0.0 && ldarp.Li[2*i+1].Lat < 0.0 && ldarp.Li[2*i+1].Lon < 0.0 {
+
+			Li_mutex.Lock()
+			// 位置情報の乱数入力
+			/*
+				ldarp.Li[2*i].Lat = random(36.5312115800549, 36.5936012942875)
+				ldarp.Li[2*i].Lon = random(139.877035771215, 140.023302745978)
+				ldarp.Li[2*i+1].Lat = random(36.5312115800549, 36.5936012942875)
+				ldarp.Li[2*i+1].Lon = random(139.877035771215, 140.023302745978)
+			*/
+
+			// 位置情報の乱数入力(+位置補正付き)
+			ldarp.Li[2*i].Source, ldarp.Li[2*i].Lon, ldarp.Li[2*i].Lat = position_correction(db, random(139.877035771215, 140.023302745978), random(36.5312115800549, 36.5936012942875))
+			ldarp.Li[2*i+1].Source, ldarp.Li[2*i+1].Lon, ldarp.Li[2*i+1].Lat = position_correction(db, random(139.877035771215, 140.023302745978), random(36.5312115800549, 36.5936012942875))
+
+			Li_mutex.Unlock()
+
+			person_num = i
+
+			break
+		}
+		person_num = -1 // 定員枠を越えた
+	}
+	if person_num == -1 { //定員枠を越える場合は、リクエストは拒絶される
+		fmt.Println("YOUR REQUEST IS REJECTED. FULLY BOOKED.")
+		return
+	}
+
+	/////////////////////////////////////////////////////
+	// 乗降情報の送信用
+	var c4i ldarp.Ch4_info
+	//c4i.Bus_number = -1
+	//c4i.Person_number = -1
+	//ldarp.Ch4 <- c4i
+	/////////////////////////////////////////////////////
+
+	///////////// 描画処理ここから ////////////////
+	_ = websocket.Upgrader{} // use default options
+
+	flag.Parse()
+	log.SetFlags(0)
+	u := url.URL{Scheme: "ws", Host: *addr, Path: "/echo2"}
+	log.Printf("connecting to %s", u.String())
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer c.Close()
+	///////////// 描画処理ここまで ////////////////
+
+	person.Number = person_num
+	person.Destination = ldarp.Li[2*person_num]
+	person.Arrival = ldarp.Li[2*person_num+1]
+	person.Action = 0 // 0:リクエスト 1:乗車 2:下車
+
+	/////// PruneMobileの初期化 ここから/////////
+	// 豊洲
+	gl := ldarp.GetLoc{
+		ID: -1, // "0"としなければならない
+		//	Lat:  35.64553503, // 初期の場所
+		//	Lng:  139.78468208,
+		TYPE: "PERSON", // "PERSON","BUS","CENTER","LRT"のいずれかが選べる
+	}
+
+	// glの要素を外出し
+	gl.Lat = person.Destination.Lat
+	gl.Lng = person.Destination.Lon
+	gl.POPUP = person_num
+
+	//fmt.Println("A:person_num:", person_num, person.Destination.Lat, person.Destination.Lon)
+
+	err = c.WriteJSON(gl) // here -> echo2
+	if err != nil {
+		log.Println("PERSON:1:Write:", err)
+		os.Exit(-1)
+	}
+
+	gl2 := new(ldarp.GetLoc)
+
+	err = c.ReadJSON(gl2) // echo2 -> here
+	if err != nil {
+		log.Println("PERSON:1:Read:", err)
+		os.Exit(-1)
+	}
+
+	gl.ID = gl2.ID
+
+	fmt.Println("person:", person_num, "gl.ID:", gl.ID)
+	/////// PruneMobileの初期化 ここまで /////////
+
+	///////////////////////////////////////////
+	ldarp.Ch1 <- person // 乗車リクエスト送信
+	///////////////////////////////////////////
+
+	boarded_bus_num := -1
+	flag_ride := 0
+
+	//// 0429 subscribe用登録(ここから)
+	conn, err := redis.Dial("tcp", "localhost:6379")
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	psc := redis.PubSubConn{Conn: conn}
+	psc.Subscribe("ch5_info")
+	//// 0429 subscribe用登録(ここまで)
+
+	for {
+
+		c5i := new(ldarp.Ch5_info)
+
+		switch v := psc.Receive().(type) {
+		case redis.Message:
+			//fmt.Printf("%s: message: %s\n", v.Channel, v.Data)
+
+			_ = json.Unmarshal(v.Data, &c5i)
+
+			b_num := c5i.Bus_num
+			cc := c5i.CC
+			present := c5i.Present
+			lat := c5i.Lat
+			lon := c5i.Lon
+
+			//b_num, id, cc, present, lat, lon := BC.Recv(last)
+			//fmt.Println("person_num:", person_num, "============>", "bus_num:", b_num, "id:", id, "cc:", cc, "present:", present, lat, lon)
+			//last = id
+
+			if cc == 2 && present == 2*person_num && flag_ride == 0 {
+				// バス番号を掴む
+
+				/////// バスに乗車したことを、センターに連絡する
+				c4i.Bus_number = b_num
+				c4i.Person_number = person_num
+				c4i.Present = present
+				c4i.Action = 1 // 乗車
+				ldarp.Ch4 <- c4i
+				////////////////////////////////////////
+
+				boarded_bus_num = b_num
+				flag_ride = 1
+
+				//fmt.Println("Person", person_num, "gets a bus", b_num, "at", present)
+				//fmt.Println("person_num:", person_num, "boarded_bus_num: ", boarded_bus_num, "passed 1")
+
+			}
+
+			if cc == 1 && flag_ride == 1 && boarded_bus_num == b_num {
+
+				/////// PruneMobileの移動 ここから/////////
+				/////バス番号と一致した座標であければ
+
+				gl.Lat = lat
+				gl.Lng = lon
+
+				//fmt.Println("B:person_num:", person_num, "boarded_bus_num: ", boarded_bus_num, lat, lon, "passed 2")
+				//fmt.Println("Person", person_num, "move with the bus", b_num, "at", lat, lon)
+
+				err = c.WriteJSON(gl)
+				if err != nil {
+					log.Println("PERSON:2:Write:", err)
+					os.Exit(-1)
+				}
+
+				gl2 := new(ldarp.GetLoc)
+				err = c.ReadJSON(gl2)
+				if err != nil {
+					log.Println("PERSON:2:Read:", err)
+					os.Exit(-1)
+				}
+
+				/////// PruneMobileの移動 ここまで/////////
+
+			}
+
+			//if cc == 2 && present == 2*person_num+1 && flag_ride == 1 && boarded_bus_num == b_num {
+			// 03/23 ↑の条件だと、broadcast.Sendが間に合わず、非常にまれにスキップされてしまうことがあるので、
+			// (非常に不本意であるが)"boarded_bus_num == b_num" を無視して受けとることにして
+			// 乗客残留問題を回避する
+			if cc == 2 && present == 2*person_num+1 && flag_ride == 1 {
+
+				flag_ride = 2
+				// 降車
+
+				/////// バスから降車したことを、センターに連絡する
+				c4i.Bus_number = b_num
+				c4i.Person_number = person_num
+				c4i.Present = present
+				c4i.Action = -1 //降車
+				ldarp.Ch4 <- c4i
+				////////////////////////////////////////
+
+				//fmt.Println("person_num:", person_num, "passed 3")
+
+				//fmt.Println("Person", person_num, "get off the bus", b_num, "at", present)
+
+				// 0429 break
+			}
+
+		case redis.Subscription:
+			fmt.Printf("%s: %s %d\n", v.Channel, v.Kind, v.Count)
+		case error:
+			return
+		}
+
+		if flag_ride == 2 { //降車後に消滅処理へ
+			break
+		}
+	}
+
+	/////// PruneMobileの終了処理 ここから/////////
+	//gl.ID = gl2.ID
+	//gl.ID = -2  /////// 諸悪の根源
+	gl.Lat = 999.9
+	gl.Lng = 999.9
+
+	err = c.WriteJSON(gl)
+	if err != nil {
+		log.Println("PERSON:3:Write:", err)
+		os.Exit(-1)
+	}
+
+	err = c.ReadJSON(gl2)
+	if err != nil {
+		log.Println("PERSON:3:Read", err)
+		os.Exit(-1)
+	}
+
+	// 30人枠の開放 (現在、乗車、予約は、最大30名まで)
+	Li_mutex.Lock()
+
+	ldarp.Li[2*person_num].Lat = -1.0
+	ldarp.Li[2*person_num].Lon = -1.0
+	ldarp.Li[2*person_num+1].Lat = -1.0
+	ldarp.Li[2*person_num+1].Lon = -1.0
+
+	Li_mutex.Unlock()
+	/////// PruneMobileの終了処理 ここまで/////////
+
+	//c.Close()
+
+	//return
+}
+
+func sub_main() {
+	ldarp.Ch1 = make(chan interface{}) // チャネルの初期化
+	ldarp.Ch2 = make(chan interface{}) // チャネルの初期化
+
+	for i := range ldarp.Ch3_bus {
+		ldarp.Ch3_bus[i] = make(chan interface{})
+	}
+
+	ldarp.Ch4 = make(chan interface{}) // チャネルの初期化
+	ldarp.Ch5 = make(chan interface{}) // チャネルの初期化
+
+	/*
+		for i := 0; i < 3; i++ {
+			go bus(i)
+			//time.Sleep(2 * time.Second) // 2秒待つ
+		}
+	*/
+
+	for i := 2; i >= 0; i-- {
+		go bus(i)
+		//time.Sleep(2 * time.Second) // 2秒待つ
+	}
+
+	go ldarp.GAEngine()
+
+	time.Sleep(3 * time.Second) // 10秒待つ
+
+	for i := 0; i < 1; i++ {
+		go lrt(i)
+		time.Sleep(1 * time.Second) // 10秒待つ
+
+	}
+
+	// 定員越えのテスト
+	for i := 0; i < 50; i++ {
+		go person()
+		//time.Sleep(1 * time.Second) // 2秒待つ
+		time.Sleep(10 * time.Second) // 10秒待つ
+	}
+
+	/*
+		for i := 0; i < 30; i++ {
+			go person(i)
+			//time.Sleep(1 * time.Second) // 2秒待つ
+			time.Sleep(1 * time.Second) // 10秒待つ
+		}
+	*/
+
+	/*
+
+		for i := 29; i >= 0; i-- {
+			go person()
+			//time.Sleep(1 * time.Second) // 2秒待つ
+			time.Sleep(1 * time.Second) // 10秒待つ
+		}
+	*/
+
+	time.Sleep(300 * time.Second) // 60秒待つ
+
+}
+
+var upgrader = websocket.Upgrader{} // use default options
+
+// GetLoc GetLoc
+type GetLoc struct {
+	ID    int     `json:"id"`
+	Lat   float64 `json:"lat"`
+	Lng   float64 `json:"lng"`
+	TYPE  string  `json:"type"` // "PERSON","BUS","CONTROL
+	POPUP int     `json:"popup"`
+	//Address string  `json:"address"`
+}
+
+func person_real(w http.ResponseWriter, r *http.Request) {
+
+	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
+
+	c_web, err := upgrader.Upgrade(w, r, nil) // cはサーバのコネクション
+	if err != nil {
+		log.Print("upgrade:", err)
+		return
+	}
+	defer c_web.Close()
+
+	gl2 := new(ldarp.GetLoc)
+	c_web.ReadJSON(&gl2) // 戻して
+	if err != nil {
+		log.Println("ReadJSON:", err)
+		return
+	}
+	fmt.Println("echo2:gl2:", gl2)
+
+	gl3 := new(ldarp.GetLoc)
+	c_web.ReadJSON(&gl3) // 戻して
+	if err != nil {
+		log.Println("ReadJSON:", err)
+		return
+	}
+	fmt.Println("echo2:gl3:", gl3)
+
+	db, err := sql.Open("postgres",
+		"user=postgres password=password host=localhost port=15432 dbname=utsu_db sslmode=disable")
+	if err != nil {
+		log.Fatal("OpenError: ", err)
+	}
+	defer db.Close()
+
+	var person_num int
+
+	for i := 0; i < 30; i++ {
+		if ldarp.Li[2*i].Lat < 0.0 && ldarp.Li[2*i].Lon < 0.0 && ldarp.Li[2*i+1].Lat < 0.0 && ldarp.Li[2*i+1].Lon < 0.0 {
+
+			Li_mutex.Lock()
+			// 位置情報の乱数入力
+
+			ldarp.Li[2*i].Lat = gl2.Lat
+			ldarp.Li[2*i].Lon = gl2.Lng
+			ldarp.Li[2*i+1].Lat = gl3.Lat
+			ldarp.Li[2*i+1].Lon = gl3.Lng
+
+			fmt.Println("1st", ldarp.Li[2*i].Lon, ldarp.Li[2*i].Lat, ldarp.Li[2*i+1].Lon, ldarp.Li[2*i+1].Lat)
+
+			// 位置情報の乱数入力(+位置補正付き)
+			ldarp.Li[2*i].Source, ldarp.Li[2*i].Lon, ldarp.Li[2*i].Lat = position_correction(db, gl2.Lng, gl2.Lat)
+			ldarp.Li[2*i+1].Source, ldarp.Li[2*i+1].Lon, ldarp.Li[2*i+1].Lat = position_correction(db, gl3.Lng, gl3.Lat)
+
+			fmt.Println("2nd", ldarp.Li[2*i].Lon, ldarp.Li[2*i].Lat, ldarp.Li[2*i+1].Lon, ldarp.Li[2*i+1].Lat)
+
+			Li_mutex.Unlock()
+
+			person_num = i
+
+			break
+		}
+		person_num = -1 // 定員枠を越えた
+	}
+	if person_num == -1 { //定員枠を越える場合は、リクエストは拒絶される
+		fmt.Println("YOUR REQUEST IS REJECTED. FULLY BOOKED.")
+		return
+	}
+
+	/////////////////////////////////////////////////////
+	// 乗降情報の送信用
+	var c4i ldarp.Ch4_info
+	//c4i.Bus_number = -1
+	//c4i.Person_number = -1
+	//ldarp.Ch4 <- c4i
+	/////////////////////////////////////////////////////
+
+	///////////// 描画処理ここから ////////////////
+	_ = websocket.Upgrader{} // use default options
+
+	flag.Parse()
+	log.SetFlags(0)
+	u := url.URL{Scheme: "ws", Host: *addr, Path: "/echo2"}
+	log.Printf("connecting to %s", u.String())
+
+	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer c.Close()
+	///////////// 描画処理ここまで ////////////////
+
+	var person ldarp.PERSON
+
+	person.Number = person_num
+	person.Destination = ldarp.Li[2*person_num]
+	person.Arrival = ldarp.Li[2*person_num+1]
+	person.Action = 0 // 0:リクエスト 1:乗車 2:下車
+
+	/////// PruneMobileの初期化 ここから/////////
+	// 豊洲
+	gl := ldarp.GetLoc{
+		ID: -1, // "0"としなければならない
+		//	Lat:  35.64553503, // 初期の場所
+		//	Lng:  139.78468208,
+		TYPE: "PERSON", // "PERSON","BUS","CENTER"のいずれかが選べる
+	}
+
+	// glの要素を外出し
+	gl.Lat = person.Destination.Lat
+	gl.Lng = person.Destination.Lon
+	gl.POPUP = person_num
+
+	//fmt.Println("A:person_num:", person_num, person.Destination.Lat, person.Destination.Lon)
+
+	err = c.WriteJSON(gl) // here -> echo2
+	if err != nil {
+		log.Println("PERSON:1:Write:", err)
+		os.Exit(-1)
+	}
+
+	//gl2 := new(ldarp.GetLoc)
+
+	err = c.ReadJSON(gl2) // echo2 -> here
+	if err != nil {
+		log.Println("PERSON:1:Read:", err)
+		os.Exit(-1)
+	}
+
+	gl.ID = gl2.ID
+
+	fmt.Println("person:", person_num, "gl.ID:", gl.ID)
+	/////// PruneMobileの初期化 ここまで /////////
+
+	///////////////////////////////////////////
+	ldarp.Ch1 <- person // 乗車リクエスト送信
+	///////////////////////////////////////////
+
+	boarded_bus_num := -1
+	flag_ride := 0
+
+	//// 0429 subscribe用登録(ここから)
+	conn, err := redis.Dial("tcp", "localhost:6379")
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	psc := redis.PubSubConn{Conn: conn}
+	psc.Subscribe("ch5_info")
+	//// 0429 subscribe用登録(ここまで)
+
+	for {
+
+		c5i := new(ldarp.Ch5_info)
+
+		switch v := psc.Receive().(type) {
+		case redis.Message:
+			//fmt.Printf("%s: message: %s\n", v.Channel, v.Data)
+
+			_ = json.Unmarshal(v.Data, &c5i)
+
+			b_num := c5i.Bus_num
+			cc := c5i.CC
+			present := c5i.Present
+			lat := c5i.Lat
+			lon := c5i.Lon
+
+			//b_num, id, cc, present, lat, lon := BC.Recv(last)
+			//fmt.Println("person_num:", person_num, "============>", "bus_num:", b_num, "id:", id, "cc:", cc, "present:", present, lat, lon)
+			//last = id
+
+			if cc == 2 && present == 2*person_num && flag_ride == 0 {
+				// バス番号を掴む
+
+				/////// バスに乗車したことを、センターに連絡する
+				c4i.Bus_number = b_num
+				c4i.Person_number = person_num
+				c4i.Present = present
+				c4i.Action = 1 // 乗車
+				ldarp.Ch4 <- c4i
+				////////////////////////////////////////
+
+				boarded_bus_num = b_num
+				flag_ride = 1
+
+				//fmt.Println("Person", person_num, "gets a bus", b_num, "at", present)
+				//fmt.Println("person_num:", person_num, "boarded_bus_num: ", boarded_bus_num, "passed 1")
+
+			}
+
+			if cc == 1 && flag_ride == 1 && boarded_bus_num == b_num {
+
+				/////// PruneMobileの移動 ここから/////////
+				/////バス番号と一致した座標であければ
+
+				gl.Lat = lat
+				gl.Lng = lon
+
+				//fmt.Println("B:person_num:", person_num, "boarded_bus_num: ", boarded_bus_num, lat, lon, "passed 2")
+				//fmt.Println("Person", person_num, "move with the bus", b_num, "at", lat, lon)
+
+				err = c.WriteJSON(gl)
+				if err != nil {
+					log.Println("PERSON:2:Write:", err)
+					os.Exit(-1)
+				}
+
+				gl2 := new(ldarp.GetLoc)
+				err = c.ReadJSON(gl2)
+				if err != nil {
+					log.Println("PERSON:2:Read:", err)
+					os.Exit(-1)
+				}
+
+				/////// PruneMobileの移動 ここまで/////////
+
+			}
+
+			//if cc == 2 && present == 2*person_num+1 && flag_ride == 1 && boarded_bus_num == b_num {
+			// 03/23 ↑の条件だと、broadcast.Sendが間に合わず、非常にまれにスキップされてしまうことがあるので、
+			// (非常に不本意であるが)"boarded_bus_num == b_num" を無視して受けとることにして
+			// 乗客残留問題を回避する
+			if cc == 2 && present == 2*person_num+1 && flag_ride == 1 {
+
+				flag_ride = 2
+				// 降車
+
+				/////// バスから降車したことを、センターに連絡する
+				c4i.Bus_number = b_num
+				c4i.Person_number = person_num
+				c4i.Present = present
+				c4i.Action = -1 //降車
+				ldarp.Ch4 <- c4i
+				////////////////////////////////////////
+
+				//fmt.Println("person_num:", person_num, "passed 3")
+
+				//fmt.Println("Person", person_num, "get off the bus", b_num, "at", present)
+
+				// 0429 break
+			}
+
+		case redis.Subscription:
+			fmt.Printf("%s: %s %d\n", v.Channel, v.Kind, v.Count)
+		case error:
+			return
+		}
+
+		if flag_ride == 2 { //降車後に消滅処理へ
+			break
+		}
+	}
+
+	/////// PruneMobileの終了処理 ここから/////////
+	//gl.ID = gl2.ID
+	//gl.ID = -2  /////// 諸悪の根源
+	gl.Lat = 999.9
+	gl.Lng = 999.9
+
+	err = c.WriteJSON(gl)
+	if err != nil {
+		log.Println("PERSON:3:Write:", err)
+		os.Exit(-1)
+	}
+
+	err = c.ReadJSON(gl2)
+	if err != nil {
+		log.Println("PERSON:3:Read", err)
+		os.Exit(-1)
+	}
+
+	// 30人枠の開放 (現在、乗車、予約は、最大30名まで)
+	Li_mutex.Lock()
+
+	ldarp.Li[2*person_num].Lat = -1.0
+	ldarp.Li[2*person_num].Lon = -1.0
+	ldarp.Li[2*person_num+1].Lat = -1.0
+	ldarp.Li[2*person_num+1].Lon = -1.0
+
+	Li_mutex.Unlock()
+	/////// PruneMobileの終了処理 ここまで/////////
+
+	//c.Close()
+
+	//return
+}
+
+func main() {
+
+	// 乗客登録情報の初期化
+	for i := 0; i < 60; i++ {
+		ldarp.Li[i].Lat = -1.0
+		ldarp.Li[i].Lon = -1.0
+		ldarp.Li[i].Source = -1
+	}
+
+	go sub_main()
+
+	http.HandleFunc("/echo2", person_real)
+	log.Fatal(http.ListenAndServe("localhost:5000", nil))
+	log.Println("server starting...", "http://localhost:5000")
+}
+
+func rad2deg(a float64) float64 {
+	return a / math.Pi * 180.0
+}
+
+func deg2rad(a float64) float64 {
+	return a / 180.0 * math.Pi
+}
+
+func distance_km(a_longitude, a_latitude, b_longitude, b_latitude float64) (float64, float64) {
+	earth_r := 6378.137
+
+	loRe := deg2rad(b_longitude - a_longitude) // 東西  経度は135度
+	laRe := deg2rad(b_latitude - a_latitude)   // 南北  緯度は34度39分
+
+	EWD := math.Cos(deg2rad(a_latitude)) * earth_r * loRe // 東西距離
+	NSD := earth_r * laRe                                 //南北距離
+
+	distance_km := math.Sqrt(math.Pow(NSD, 2) + math.Pow(EWD, 2))
+	rad_up := math.Atan2(NSD, EWD)
+
+	return distance_km, rad_up
+}
+
+func diff_longitude(diff_p_x, latitude float64) float64 {
+
+	earth_r := 6378.137
+	// ↓ これが正解だけど、
+	loRe := diff_p_x / earth_r / math.Cos(deg2rad(latitude)) // 東西
+	// 面倒なので、これで統一しよう(あまり差が出ないしね)
+	//loRe := diff_p_x / earth_r / math.Cos(deg2rad(35.700759)) // 東西
+	diff_lo := rad2deg(loRe) // 東西
+
+	return diff_lo // 東西
+}
+
+func diff_latitude(diff_p_y float64) float64 {
+	earth_r := 6378.137
+	laRe := diff_p_y / earth_r // 南北
+	diff_la := rad2deg(laRe)   // 南北
+
+	return diff_la // 南北
+}
